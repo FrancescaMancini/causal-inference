@@ -154,5 +154,4 @@ all_data <- all_data %>%
          temp_anomaly = temp_mean - site_mean_temp)
 
 
-
 saveRDS(all_data, "./Data/beewalk_drivers_merged.rds")
