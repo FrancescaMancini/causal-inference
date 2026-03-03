@@ -153,5 +153,24 @@ all_data <- all_data %>%
   mutate(site_mean_temp = mean(temp_mean, na.rm = TRUE),
          temp_anomaly = temp_mean - site_mean_temp)
 
+# extract temp in previous year
+
+# 1) Build a per-site per-year temperature table
+temp_by_site_year <- all_data %>%
+  distinct(GridReference, Year, temp_mean)
+
+# 2) Create (year - 1) table and join back
+temp_prev <- temp_by_site_year %>%
+  transmute(GridReference,
+            Year = Year + 1,                # shift forward so we can join to "previous year"
+            temp_prev_year = temp_mean) # renamed column
+
+# 3) Join to the full visit-level data
+all_data <- all_data %>%
+  left_join(temp_prev, by = c("GridReference", "Year")) %>%
+  filter(Year > 2013) # exclude 2013
+
+# df_with_prev now has a column 'temp_prev_year' = previous year's avg temp for that site
+
 
 saveRDS(all_data, "./Data/beewalk_drivers_merged.rds")

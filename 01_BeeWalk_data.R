@@ -14,7 +14,7 @@ table(beewalk$Precision)
 # filters and checks
 
 beewalk <- beewalk %>%
-  filter(Year > 2013) %>%
+  filter(Year > 2012) %>%
   filter(Precision <= 1000)
 
 nyear_by_site <- beewalk %>%
