@@ -1,0 +1,137 @@
+# analysis
+# pkgs <- c("fixest", "glmmTMB", "performance", "lmtest", "sandwich")
+# install.packages(pkgs)
+
+library(fixest)      # for panel FE models
+library(glmmTMB)     # for GLMM comparison models
+library(tidyverse)
+
+
+# First load the data.
+all_data <- readRDS("./Data/beewalk_drivers_merged.rds")
+str(all_data)
+
+# We are interested in the effect of temperature on bumblebee abundance. 
+# Let's pick one species for now, Bombus hypnorum, a common and widespread species.
+
+all_data_1sp <- all_data %>%
+  filter(latin == "Bombus hypnorum")
+
+# Now we fit a GLMM with mean temperature as a covariate and a random effect for site.
+re_model_temp <- glmmTMB(
+  TotalCount ~ temp_mean + (1|GridReference),
+  data = all_data_1sp,
+  family = nbinom1
+)
+
+summary(re_model_temp)
+
+# Effect of tempearture is significant and the coefficient is negative (-0.03).
+
+
+# Now we fit a fixed effect panel regression with a fixed effect for site. 
+# This accounts for time invarying site confounders (variables that vary by site but not by time). 
+
+
+mod_fe <- fenegbin(
+  TotalCount ~ temp_mean | GridReference,
+  data = all_data_1sp,
+  cluster = ~ GridReference # clustered SEs as per Dee et al.
+)
+
+summary(mod_fe)
+
+
+
+# The effect of temperature is still negative but smaller and non significant. 
+
+
+# Now I will fit the same model but adding a fixed effect for year. 
+# This accounts for any time varying confounders that are equal across sites.
+
+
+mod_fe2 <- fenegbin(
+  TotalCount ~ temp_mean | GridReference + Year,
+  data = all_data_1sp,
+  cluster = ~ GridReference # clustered SEs as per Dee et al.
+)
+
+summary(mod_fe2)
+
+# This changes the sign of the coefficient and the p value is even larger.
+# It's possible that we don't have enough power due to the fixed effects.
+
+
+
+# The next two designs allow us to do the same without the inefficiency of the fixed effects.
+
+#  group mean covariate design
+
+GMCov <- glmmTMB(
+  TotalCount ~ temp_mean + site_mean_temp + (1|GridReference),
+  data = all_data_1sp,
+  family = nbinom1
+)
+
+summary(GMCov)
+
+# This is telling us that the effect of temperature is negative and significant. 
+# The contextual effect (the effect of site mean temperature) is close to 0, 
+# which in theory means that there are no site level confounders and therefore a mixed model is enough.
+
+# But the mean temperature and site mean temperature are strongly correlated, which makes the previous model not appropriate.
+                                           
+ggplot(all_data_1sp,
+       aes(x = site_mean_temp, y = temp_mean)) +
+  geom_point()                                          
+
+# The Group Mean Centered design removes this correlation by centering the causal variable 
+# around the site average. In this case we create a anomaly temperature variable, 
+# by subtracting the site mean temperature scross years from the average temperature for that year.
+# first derive the site temperature anomaly (temp variable centered around the average site temp)
+
+all_data_1sp <- all_data_1sp %>%
+  mutate(temp_cent = temp_mean - site_mean_temp)
+
+
+GMCent <- glmmTMB(
+  TotalCount ~ temp_cent + site_mean_temp + (1|GridReference),
+  data = all_data_1sp,
+  family = nbinom1
+)
+
+summary(GMCent)
+
+# The effect of mean temperature is negative and the same as estimated by the previous model. 
+# But now we have removed the correlation between the two variables. 
+# The effect of site mean temperature is also negative, 
+# but this includes unmeasured confounders that vary across sites as well so it cannot be interpreted causally.
+
+
+# The differencing designs are useful to separate correlated drivers 
+# (confounders that have the same temporal trend as the causal variable) 
+# that vary by site as well. We use a second differencing design 
+# as we are not particularly interested in site specific trends.
+# 
+# The first step is to calculate the difference in both the response and 
+# causal variable between year x and year x-2. Then we fit a linear model.
+
+data_sd <- all_data_1sp %>%
+  arrange(GridReference, Year) %>%
+  group_by(GridReference) %>%
+  mutate(
+    dy = TotalCount - lag(TotalCount),
+    dx = temp_mean - lag(temp_mean),
+    d2y = dy - lag(dy),
+    d2x = dx - lag(dx)
+  ) %>%
+  ungroup() %>%
+  filter(!is.na(d2y), !is.na(d2x))
+
+sDiff <- lm(d2y ~ d2x, data = data_sd)
+summary(sDiff)
+
+# Effect os still negative and similar in magnitude, but it is not significant.
+
+# What does it all mean??
+  
