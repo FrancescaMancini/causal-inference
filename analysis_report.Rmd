@@ -8,9 +8,13 @@ output: html_document
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE)
 
-library(fixest)      # for panel FE models
-library(glmmTMB)     # for GLMM comparison models
+
+library(fixest)
+library(glmmTMB)
 library(tidyverse)
+library(broom.mixed)   # for tidying glmmTMB models
+library(broom)         # for lm models
+library(forcats)
 
 ```
 
@@ -22,146 +26,382 @@ all_data <- readRDS("./Data/beewalk_drivers_merged.rds")
 str(all_data)
 ```
 
-We are interested in the effect of temperature on bumblebee abundance. Let's pick one species for now, *Bombus hypnorum*, a common and widespread species.
+First, I need tofilter the dataset to only keep bumblebee species and impute zeros for all species that were not observed during a transect walk.
 
 ```{r}
 
-all_data_1sp <- all_data %>%
-  filter(latin == "Bombus hypnorum")
+# filter out all species that are not bumblebees as they are not reliably reported
+# filter out all observations not at species level "Bombus sp."
+# filter out NAs in the temp columns
+# and keep only variables of interest
+# finally ungroup dataset
+all_data <- all_data %>%
+    filter(str_detect(latin, "^Bombus")) %>%
+  filter(latin != "Bombus sp.") %>% 
+  drop_na(temp_mean, site_mean_temp) %>%
+  select(GridReference, section_grid_ref, StartDate, latin, TaxonVersionKey, 
+         TotalCount, Year, temp_mean, site_mean_temp) %>%
+  ungroup()
 
-```
+# list all species ever observed
+all_species <- unique(all_data$TaxonVersionKey)
 
-Now we fit a GLMM with mean temperature as a covariate and a random effect for site. 
+# identify all sampling events
+sampling_events <- all_data %>%
+  distinct(GridReference, section_grid_ref, StartDate,
+           Year, temp_mean, site_mean_temp,
+           .keep_all = FALSE)
 
-```{r}
+# Create a full dataset of all event × species combinations
 
-re_model_temp <- glmmTMB(
-  TotalCount ~ temp_mean + (1|GridReference),
-  data = all_data_1sp,
-  family = nbinom1
-)
-
-summary(re_model_temp)
-
-```
-Effect of tempearture is significant and the coefficient is negative (-0.03).
-
-
-Now we fit a fixed effect panel regression with a fixed effect for site. This accounts for time invarying site confounders (variables that vary by site but not by time). 
-
-```{r}
-
-mod_fe <- fenegbin(
-  TotalCount ~ temp_mean | GridReference,
-  data = all_data_1sp,
-  cluster = ~ GridReference # clustered SEs as per Dee et al.
-)
-
-summary(mod_fe)
+all_events_expanded <- sampling_events %>%
+  crossing(TaxonVersionKey = all_species)
 
 
 
-```
+# 5. Prepare species-level data WITHOUT event-level covariates
+all_data_species <- all_data %>%
+  select(GridReference, section_grid_ref, StartDate,
+         Year, TaxonVersionKey, TotalCount)
 
+# 6. Join back counts and species fields 
+all_data_zero_filled <- all_events_expanded %>%
+  left_join(all_data_species,
+            by = c("GridReference", "section_grid_ref",
+                   "StartDate", "Year", "TaxonVersionKey")) %>%
+  mutate(TotalCount = replace_na(TotalCount, 0))
 
-The effect of temperature is still negative but smaller and non significant. 
-Now I will fit the same model but adding a fixed effect for year. This accounts for any time varying confounders that are equal across sites.
+# create a species-TVK lookup table
 
-```{r}
-
-mod_fe2 <- fenegbin(
-  TotalCount ~ temp_mean | GridReference + Year,
-  data = all_data_1sp,
-  cluster = ~ GridReference # clustered SEs as per Dee et al.
-)
-
-summary(mod_fe2)
-
-```
-
-This changes the sign of the coefficient and the p value is even larger.
-It's possible that we don't have enough power due to the fixed effects.
-
-The next two designs allow us to do the same without the inefficiency of the fixed effects.
-
-```{r}
-
-GMCov <- glmmTMB(
-  TotalCount ~ temp_mean + site_mean_temp + (1|GridReference),
-  data = all_data_1sp,
-  family = nbinom1
-)
-
-summary(GMCov)
-
+sp_tvk_lookup <- unique(all_data[, c("latin", "TaxonVersionKey")])
 
 ```
 
 
-This is telling us that the effect of temperature is negative and significant. The contextual effect (the effect of site mean temperature) is close to 0, which in theory means that there are no site level confounders and therefore a mixed model is enough.
+Wewant to fit the following 6 models to each species: 
+* GLMM with random effect for site and temperature as covariate  
+* Fixed effect model 1 (FE1): fixed effect for site 
+* Fixed effect model 2 (FE2): fixed effect for site + year 
+* Group Mean Covariate (GMCov) model with a random effect for site, mean site temperature and temperature as covariates 
+* Group Mean Centered (GMCent) model with a random effect for site, mean site temperature and temperature centered around the site mean as covariates 
+* Second difference model (Diff) 
 
-But the mean tem[erature and site mean tem[perature are strongly correlated, which makes the previous model not appropriate.
-
-
-```{r}
-
-ggplot(all_data_1sp,
-       aes(x = site_mean_temp, y = temp_mean)) +
-  geom_point()
-
-```
-
-
-The Group Mean Centered design removes this correlation by centering the causal variable around the site average. In this case we create a anomaly temperature variable, by subtracting the site mean temperature scross years from the average temperature for that year.
+First we want to create a function tha runs all models for one species.
 
 ```{r}
+# this catches errors and warnings so we can identify models that did not converge
 
-# first derive the site temperature anomaly (temp variable centered around the average site temp)
-
-all_data_1sp <- all_data_1sp %>%
-  mutate(temp_cent = temp_mean - site_mean_temp)
-
-
-GMCent <- glmmTMB(
-  TotalCount ~ temp_cent + site_mean_temp + (1|GridReference),
-  data = all_data_1sp,
-  family = nbinom1
-)
-
-summary(GMCent)
+safe_fit <- function(expr) {
+  q <- purrr::quietly(function() expr)()
+  tibble(
+    model_object = list(q$result),
+    warning_msg  = paste(q$warnings, collapse = "; "),
+    error_msg    = paste(q$errors, collapse = "; "),
+    message_msg  = paste(q$messages, collapse = "; ")
+  )
+}
 
 
+fit_all_models_for_species <- function(sp, data) {
+  
+  dat <- data %>% filter(TaxonVersionKey == sp)
+  dat2 <- dat %>% mutate(temp_cent = temp_mean - site_mean_temp)
 
-```
+  # 1) Mixed model (glmmTMB)
+  m_re_row <- safe_fit(
+    glmmTMB(TotalCount ~ temp_mean + (1|GridReference),
+            data = dat, family = nbinom1)
+  )
+  
+  # 2) FE site
+  m_fe_row <- safe_fit(
+    fenegbin(TotalCount ~ temp_mean | GridReference,
+             data = dat, cluster = ~GridReference)
+  )
+  
+  # 3) FE site + year
+  m_fe2_row <- safe_fit(
+    fenegbin(TotalCount ~ temp_mean | GridReference + Year,
+             data = dat, cluster = ~GridReference)
+  )
+  
+  # 4) Group mean covariate
+  m_gmcov_row <- safe_fit(
+    glmmTMB(TotalCount ~ temp_mean + site_mean_temp + (1|GridReference),
+            data = dat, family = nbinom1)
+  )
+  
+  # 5) Group mean centred
+  m_gmcent_row <- safe_fit(
+    glmmTMB(TotalCount ~ temp_cent + site_mean_temp + (1|GridReference),
+            data = dat2, family = nbinom1)
+  )
+  
+  # 6) Second differencing
+  dat_sd <- dat %>%
+    arrange(GridReference, Year) %>%
+    group_by(GridReference) %>%
+    mutate(
+      dy = TotalCount - lag(TotalCount),
+      dx = temp_mean - lag(temp_mean),
+      d2y = dy - lag(dy),
+      d2x = dx - lag(dx)
+    ) %>%
+    filter(!is.na(d2y), !is.na(d2x)) %>%
+    ungroup()
 
-The effect of mean temperature is negative and the same as estimated by the previous model. But now we have removed the correlation between the two variables. The effect of site mean temperature is also negative, but this includes unmeasured confounders that vary across sites as well so it cannot be interpreted causally.
+  m_sdiff_row <- safe_fit(
+    lm(d2y ~ d2x, data = dat_sd)
+  )
 
-The differencing designs are useful to separate correlated drivers (confounders that have the same temporal trend as the causal variable) that vary by site as well. We use a second differencing design as we are not particularly interested in site specific trends.
-
-The first step is to calculate the difference in both the response and causal variable between year x and year x-2. Then we fit a linear model.
-
-```{r}
-
-data_sd <- all_data_1sp %>%
-  arrange(GridReference, Year) %>%
-  group_by(GridReference) %>%
-  mutate(
-    dy = TotalCount - lag(TotalCount),
-    dx = temp_mean - lag(temp_mean),
-    d2y = dy - lag(dy),
-    d2x = dx - lag(dx)
+  # Combine all model rows
+  model_rows <- bind_rows(
+    m_re_row  %>% mutate(model = "RE_glmmTMB"),
+    m_fe_row  %>% mutate(model = "FE_site"),
+    m_fe2_row %>% mutate(model = "FE_site_year"),
+    m_gmcov_row %>% mutate(model = "GM_cov"),
+    m_gmcent_row %>% mutate(model = "GM_centered"),
+    m_sdiff_row %>% mutate(model = "Second_diff")
   ) %>%
-  ungroup() %>%
-  filter(!is.na(d2y), !is.na(d2x))
+    mutate(species = sp)
 
-sDiff <- lm(d2y ~ d2x, data = data_sd)
-summary(sDiff)
+  # ---- Extract coefficients if model exists ----
+  coef_rows <- model_rows %>%
+    mutate(
+      tidied = map(model_object, ~ if (is.null(.x)) tibble() else broom::tidy(.x))
+    ) %>%
+    unnest(tidied)
+
+  return(coef_rows %>%
+           select(species, model, term, estimate, std.error, statistic, p.value,
+                  warning_msg, error_msg, message_msg))
+}
+
+```
+
+
+Then we apply the function to all species.
+
+```{r}
+
+
+coef_table <- map_dfr(all_species, fit_all_models_for_species, data = all_data_zero_filled)
 
 
 ```
 
-Effect os still negative and similar in magnitude, but it is not significant.
 
-What does it all mean??
+Filter to only the temperature‑related coefficients.
+
+```{r}
+
+coef_temp <- coef_table %>%
+  filter(term %in% c("temp_mean", "temp_cent", "d2x"))
+
+# join species names back in
+coef_temp <- left_join(coef_temp, sp_tvk_lookup, by = c("species" = "TaxonVersionKey"))
+
+
+```
+
+
+Plot coefficients across species and models.
+
+```{r fig.height=7, fig.width=7}
+
+# we exclude "NHMSYS0000875592", which is B. subterraneus as most models did not converge. 
+# This is a very rare species with sparse data
+
+# plot the effects
+# but exclude B.distinguendus, B. ruderarius, B.barbutellus and B. ruderatus
+# the fixed effect models have very large standard errors
+coef_temp_plot <- coef_temp %>%
+  filter(!(latin %in% c("Bombus subterraneus",
+                        "Bombus distinguendus",
+                        "Bombus ruderarius",
+                        "Bombus ruderatus",
+                        "Bombus barbutellus"))) %>%
+  mutate(latin = fct_reorder(latin, estimate, .fun = median, .desc = TRUE))
+
+ggplot(coef_temp_plot,
+       aes(x = estimate, y = latin, colour = model)) +
+  geom_vline(xintercept = 0, colour = "grey50", linewidth = 0.6, linetype = 2) +
+  geom_errorbarh(aes(xmin = estimate - std.error,
+                     xmax = estimate + std.error),
+                 height = 0, linewidth = 0.7, alpha = 0.9) +
+  geom_point(size = 1.8) +
+  facet_wrap(~ model, ncol = 3, scales = "fixed") +   
+  labs(
+    title = "Temperature effect by species",
+    x = "Coefficient estimate (± 1 SE)",
+    y = NULL
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    panel.grid.major.y = element_line(colour = "grey90"),
+    panel.grid.minor = element_blank(),
+    legend.position = "none"
+  )
+```
+
+It looks like there is a range of responses across the species, from negative to positive. The differencing model design always estimates the samllest effects (close to 0) and the effect is not significant for most species. The fixed effects panel regression designs show the largest standard errors, especially the model with both site and year fixed effects. Finally the random effect model, although very precise, it sometimes gets the magnitude and direction of the effect wrong!
+
+
+Let's make some more comparison plots.
+First align the names of the temperature effects across models.
+
+```{r}
+
+# Map each model to its temperature-effect term
+temp_term_by_model <- tribble(
+  ~model,           ~temp_term,
+  "RE_glmmTMB",     "temp_mean",
+  "FE_site",        "temp_mean",
+  "FE_site_year",   "temp_mean",
+  "GM_cov",         "temp_mean",   # within-year temp effect, not the contextual site_mean_temp
+  "GM_centered",    "temp_cent",
+  "Second_diff",    "d2x"
+)
+
+coef_temp_aligned <- coef_temp %>%
+  inner_join(temp_term_by_model, by = "model") %>%
+  filter(term == temp_term) %>%
+  # (optional) keep only species that seem reliable
+  filter(!(latin %in% c("Bombus subterraneus",
+                        "Bombus distinguendus",
+                        "Bombus ruderarius",
+                        "Bombus ruderatus",
+                        "Bombus barbutellus"))) %>%
+  mutate(
+    model = factor(model, levels = c("RE_glmmTMB","FE_site","FE_site_year",
+                                     "GM_cov","GM_centered","Second_diff")),
+    latin = fct_reorder(latin, estimate, .fun = median, .desc = TRUE)
+  )
+
+```
+
+
+
+First let's compare the direction and significance of the temperature effect across species and models.
+
+```{r, fig.height=9, fig.width=11}
+
+sig_heat <- coef_temp_aligned %>%
+  mutate(signif = case_when(
+    is.na(p.value)            ~ "NA",
+    p.value < 0.05 & estimate > 0 ~ "Pos sig",
+    p.value < 0.05 & estimate < 0 ~ "Neg sig",
+    TRUE                         ~ "NS"
+  ))
+
+ggplot(sig_heat, aes(x = model, y = latin, fill = signif)) +
+  geom_tile(color = "white") +
+  scale_fill_manual(values = c("Pos sig" = "#3274A1", "Neg sig" = "#E15759",
+                               "NS" = "grey80", "NA" = "grey50")) +
+  labs(title = "Sign & significance across species and models",
+       x = NULL, y = NULL, fill = NULL) +
+  theme_minimal(base_size = 12) +
+  theme(panel.grid = element_blank())
+
+```
+This confirms what we saw in the previous plot, the second differencing approach rarely detects a significant result, just like the fixed effect panel regression with fixed effects for both site and year. The fixed effect panel regression with fixed effect for site and the two correlated random effects approaches broadly agree and produce similar results, except for two species B. campestris and B. muscorum. The random effect model detects the most significant effects and sometimes disagrees with other models on the direction of the effect (B. vestalis). 
+
+Then we can do some scatterplots of pairwise comparisons of magnitude and uncertainty of the temperature effect between models across all species. 
+
+```{r fig.height=9, fig.width=11}
+
+library(patchwork)
+
+model_levels <- levels(coef_temp_aligned$model)
+pairs <- combn(model_levels, 2, simplify = FALSE)
+
+
+lims <- range(
+  coef_temp_aligned$estimate + coef_temp_aligned$std.error,
+  coef_temp_aligned$estimate - coef_temp_aligned$std.error,
+  na.rm = TRUE
+)
+
+
+
+plot_pair <- function(pair) {
+  a <- pair[1]
+  b <- pair[2]
+  
+  df <- coef_temp_aligned %>%
+    filter(model %in% c(a, b)) %>%
+    select(latin, model, estimate, std.error) %>%
+    pivot_wider(names_from = model, values_from = c(estimate, std.error), names_sep = "_") %>%
+    drop_na()
+  
+  # rename
+  df <- df %>% rename(
+    est_a = paste0("estimate_", a),
+    est_b = paste0("estimate_", b),
+    se_a  = paste0("std.error_", a),
+    se_b  = paste0("std.error_", b)
+  )
+  
+  # must return a ggplot object ALWAYS
+  if (nrow(df) == 0) {
+    return(
+      ggplot() +
+        annotate("text", 0, 0, label = paste("No data for", a, "vs", b)) +
+        theme_void()
+    )
+  }
+  
+  ggplot(df, aes(x = est_a, y = est_b)) +
+    geom_errorbarh(aes(xmin = est_a - se_a,
+                       xmax = est_a + se_a),
+                   height = 0, alpha = 0.4) +
+    geom_errorbar(aes(ymin = est_b - se_b,
+                      ymax = est_b + se_b),
+                  width = 0, alpha = 0.4) +
+    geom_abline(slope = 1, intercept = 0, linetype = 2, colour = "grey40") +
+    geom_point(size = 1.8, colour = "steelblue") +
+    coord_equal() +
+    theme_minimal(base_size = 11) +
+    labs(title = paste(a, "vs\n", b), x = a, y = b) + 
+    coord_equal(xlim = lims, ylim = lims)
+
+}
+
+pair_plots <- map(pairs, plot_pair)
+
+# Correct patchwork usage (no & operator)
+final_panel <- wrap_plots(pair_plots) +
+  plot_layout(guides = "collect") +
+  theme(legend.position = "bottom")
+
+final_panel
+
+```
+
+
+Now let's compare the width of the standard errors.
+
+```{r}
+
+# Boxplot
+ggplot(coef_temp_aligned, aes(x = model, y = std.error, fill = model)) +
+  geom_boxplot(outlier.alpha = 0.3, width = 0.7) +
+  coord_flip() +
+  labs(title = "Uncertainty distribution by model",
+       y = "Standard error", x = NULL) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "none")
+
+```
+
+
+As expected, the fixed effect panel regression approaches produce the most uncertain estimates, especially when fixed effects for both site and year are included. The random effect model seems to be the most precise model, but quite comparable with the correlated random effect approaches and the differencing approach.
+
+
+
+
+
+
+
 
 

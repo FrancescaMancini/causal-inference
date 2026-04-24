@@ -1,0 +1,340 @@
+---
+title: "Predictive performance"
+author: "Francesca Mancini"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+
+library(yardstick)
+library(dplyr)
+library(purrr)
+library(glmmTMB)
+library(fixest)
+library(tidyr)
+library(ggplot2)
+
+```
+
+We want to compare the predictive performance of the six models fitted in analysis_report.Rmd. This script sets up and runs a cross validation experiment and compares teh performance of different models across species using a set of performance metrics.
+
+First load the data.
+
+```{r}
+
+all_data_zero_filled <- readRDS("./all_data_zero_filled.rds")
+
+```
+
+Define a function to calculate performance metrics. We use three metrics:
+* Root Mean Squares Error (RMSE) - this measures the average size of the prediction error, it squares the error so it penalises large mistakes
+* Mean Absolute Error (MAE) - measueres average absolute deviation between predictions and true valies, it is easier to interpret as we can say that on average the model is off by X number of inviduals and it is good when abundance distributions are skewed (as is the case with species counts)
+* Predictive R-squared (R2) - it compares the model's predictions to a naive baseline model (the mean), if R2 > 0 the model beats the baseline, if R2 < 0 the model performs worse than a mean-only model; it basically compares the explained variance of the model with that of the mean
+
+
+
+
+```{r}
+
+
+perf_metrics <- function(truth, pred) {
+  tibble(
+    RMSE = yardstick::rmse_vec(truth, pred),
+    MAE  = yardstick::mae_vec(truth, pred),
+    R2   = yardstick::rsq_vec(truth, pred)
+  )
+}
+
+
+```
+
+
+Now we define a function to fit the different models.
+
+```{r}
+
+fit_model_set <- function(train_data, temp_center = TRUE) {
+  
+  # model matrices
+  if (temp_center) {
+    train_data <- train_data %>%
+      mutate(temp_cent = temp_mean - site_mean_temp)
+  }
+  
+  models <- list()
+  
+  # 1. Mixed model
+  models$RE <- glmmTMB(
+    TotalCount ~ temp_mean + (1 | GridReference),
+    data = train_data, family = nbinom1
+  )
+  
+  # 2. FE site
+  models$FE_site <- fenegbin(
+    TotalCount ~ temp_mean | GridReference,
+    data = train_data, cluster = ~GridReference
+  )
+  
+  # 3. FE site + year
+  models$FE_site_year <- fenegbin(
+    TotalCount ~ temp_mean | GridReference + Year,
+    data = train_data, cluster = ~GridReference
+  )
+  
+  # 4. GM covariate
+  models$GM_cov <- glmmTMB(
+    TotalCount ~ temp_mean + site_mean_temp + (1 | GridReference),
+    data = train_data, family = nbinom1
+  )
+  
+  # 5. GM centered
+  models$GM_centered <- glmmTMB(
+    TotalCount ~ temp_cent + site_mean_temp + (1 | GridReference),
+    data = train_data, family = nbinom1
+  )
+  
+  # 6. Second difference
+  train_sd <- train_data %>%
+    arrange(GridReference, Year) %>%
+    group_by(GridReference) %>%
+    mutate(
+      dy = TotalCount - lag(TotalCount),
+      dx = temp_mean - lag(temp_mean),
+      d2y = dy - lag(dy),
+      d2x = dx - lag(dx)
+    ) %>%
+    ungroup() %>%
+    filter(!is.na(d2y), !is.na(d2x))
+  
+  models$Differences <- lm(d2y ~ d2x, data = train_sd)
+  
+  return(models)
+}
+
+```
+
+Now we define a function that generates predictions for each model.
+
+```{r}
+
+predict_model <- function(model, model_name, new_data) {
+  
+  # -----------------------------
+  # 1) RE and GM_cov (glmmTMB)
+  # -----------------------------
+  if (model_name %in% c("RE", "GM_cov")) {
+    return(
+      predict(
+        model,
+        newdata = new_data,
+        type = "response",
+        re.form = NA
+      )
+    )
+  }
+  
+  # -----------------------------
+  # 2) GM_centered (glmmTMB with centered covariate)
+  # -----------------------------
+  if (model_name == "GM_centered") {
+    
+    # MUST recompute centered covariate for test fold
+    new_data <- new_data %>%
+      mutate(temp_cent = temp_mean - site_mean_temp)
+    
+    return(
+      predict(
+        model,
+        newdata = new_data,
+        type = "response",
+        re.form = NA
+      )
+    )
+  }
+  
+  # -----------------------------
+  # 3) fixest FE models
+  # -----------------------------
+  if (model_name %in% c("FE_site", "FE_site_year")) {
+    return(
+      predict(
+        model,
+        newdata = new_data,
+        type = "response",
+        fixef = FALSE
+      )
+    )
+  }
+  
+  # -----------------------------
+  # 4) Differencing model
+  # -----------------------------
+  if (model_name == "Differences") {
+    
+    new_sd <- new_data %>%
+      arrange(GridReference, Year) %>%
+      group_by(GridReference) %>%
+      mutate(
+        dy = TotalCount - lag(TotalCount),
+        dx = temp_mean - lag(temp_mean),
+        d2y = dy - lag(dy),
+        d2x = dx - lag(dx)
+      ) %>%
+      ungroup() %>%
+      filter(!is.na(d2x))
+    
+    pred <- predict(model, newdata = new_sd)
+    
+    out <- rep(NA, nrow(new_data))
+    idx <- match(new_sd$StartDate, new_data$StartDate)
+    out[idx] <- pred
+    
+    return(out)
+  }
+  
+  stop("Unknown model type")
+}
+
+```
+
+Now we set up the k-fold cross validation, run the models for each species and then combine the results.
+
+```{r, eval=FALSE}
+
+K <- 5  # number of folds
+
+species_ids <- unique(all_data_zero_filled$TaxonVersionKey)
+
+cv_results <- map_dfr(species_ids, function(sp) {
+  
+  dat <- all_data_zero_filled %>% filter(TaxonVersionKey == sp)
+  
+  # assign folds
+  set.seed(123)
+  dat <- dat %>% mutate(fold = sample(rep(1:K, length.out = n())))
+  
+  # iterate folds
+  fold_results <- map_dfr(1:K, function(f) {
+    
+    train <- dat %>% filter(fold != f)
+    test  <- dat %>% filter(fold == f)
+    
+    # fit all models
+    models <- fit_model_set(train)
+    
+    # predictions for each model
+    preds <- map2_dfc(models, names(models),
+      ~ tibble(!!paste0(.y, "_pred") := predict_model(.x, .y, test))
+    )
+    
+    # merge truth + predictions
+    df <- bind_cols(
+      tibble(
+        species = sp,
+        fold = f,
+        truth = test$TotalCount
+      ),
+      preds
+    )
+    
+    # long format for metrics
+    df_long <- df %>%
+      pivot_longer(
+        cols = ends_with("_pred"),
+        names_to = "model",
+        values_to = "pred"
+      ) %>%
+      mutate(model = sub("_pred$", "", model))
+    
+    # compute performance metrics per model
+    df_long %>%
+      group_by(species, model, fold) %>%
+      summarise(perf_metrics(truth, pred), .groups = "drop")
+    
+  })
+  
+  return(fold_results)
+})
+
+```
+
+```{r, echo=FALSE}
+
+cv_results <- readRDS("cv_results.rds")
+
+```
+
+
+Then summarise performance metrics across folds and species.
+
+```{r}
+
+cv_summary <- cv_results %>%
+  group_by(species, model) %>%
+  summarise(
+    RMSE = mean(RMSE, na.rm = TRUE),
+    MAE  = mean(MAE,  na.rm = TRUE),
+    R2   = mean(R2,   na.rm = TRUE),
+    .groups = "drop"
+  )
+
+```
+
+Exclude the species that we know return unreliable models: B. subterraneus, B.distinguendus, B. ruderarius, B.barbutellus and B. ruderatus.
+
+
+```{r}
+sp_tvk_lookup <- readRDS("sp_tvk_lookup.rds")
+
+cv_summary <- left_join(cv_summary, sp_tvk_lookup, by = c("species" = "TaxonVersionKey")) %>%
+  filter(!(latin %in% c("Bombus subterraneus",
+                        "Bombus distinguendus",
+                        "Bombus ruderarius",
+                        "Bombus ruderatus",
+                        "Bombus barbutellus")))
+
+```
+
+And plot the performance metrics. First RMSE.
+
+```{r}
+
+ggplot(cv_summary, aes(x = model, y = RMSE, colour = model)) +
+  geom_boxplot(outlier.alpha = 0.2) +
+  theme_minimal() +
+  labs(title = "Predictive RMSE across models", y = "RMSE", x = NULL) +
+  theme(legend.position = "none")
+
+```
+
+
+Then R2.
+
+```{r}
+
+ggplot(cv_summary, aes(x = model, y = R2, fill = model)) +
+  # geom_violin(alpha = 0.7) +
+  geom_boxplot(width = 0.12) +
+  theme_minimal() +
+  labs(title = "Predictive R² across models", y = "R² (pred)", x = NULL) +
+  theme(legend.position = "none")
+
+```
+
+
+And finally MAE.
+
+```{r}
+
+ggplot(cv_summary, aes(x = model, y = MAE, colour = model)) +
+  geom_boxplot(outlier.alpha = 0.2) +
+  theme_minimal() +
+  labs(title = "Predictive MAE across models", y = "RMSE", x = NULL) +
+  theme(legend.position = "none")
+
+```
+
+
